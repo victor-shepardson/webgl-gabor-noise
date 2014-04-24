@@ -61,7 +61,7 @@ int poisson(inout float u, const float m){
 //Gabor noise based on Lagae, Lefebvre, Drettakis, Dutre 2011
   float eval_cell(const vec2 cpos, const ivec2 gpos, const ivec2 dnbr, const gnoise_params params, const gnoise_im_params im_params){
 	float u = seed(bound_grid(gpos+dnbr)); //deterministic seed for nbr cell
-	int impulses = int(params.density*(1./PI)+.5);//poisson(u, params.density*(1./PI)); //number of impulses in nbr cell
+	int impulses = poisson(u, params.density*(1./PI)); //number of impulses in nbr cell
 	vec4 h = params.sector; //annular sector
 	float a = params.a; //bandwidth
 	float aps = im_params.a_prime_square; //intermediate calculations for filtering
