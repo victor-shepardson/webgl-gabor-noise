@@ -5,7 +5,6 @@ precision mediump int;
 
 #define PI 3.1415926535897932384626
 #define IMPULSE_CAP 128
-#define IMOD 4096
 
 struct gnoise_params{ //struct for input params to gabor noise
 	float a, density, filterSigma, octaves;
@@ -15,37 +14,38 @@ struct gnoise_params{ //struct for input params to gabor noise
 
 struct gnoise_im_params{ //struct to pass intermediate values within gnoise
 	mat2 filter, sigma_f_plus_g_inv;
-	float ainv, a_prime_square;
+	float ainv, a_prime_square, filt_scale;
 };
-
-ivec2 bound_grid(const ivec2 gpos){
-	return gpos + IMOD*(1 - gpos/IMOD);
-}
 
 //hash based on Blum, Blum & Shub 1986
 //and Sharpe http://briansharpe.wordpress.com/2011/10/01/gpu-texture-free-noise/
-const float bbsm = 137023.;//magic product of two primes chosen to have high period without float precision issues
-vec2 bbsmod( const vec2 a ) {
-	return a - floor( a * ( 1.0 / bbsm ) ) * bbsm;
-}
-vec2 bbs(const vec2 a) {
-	return bbsmod(a*a);
+const float bbsm = 1739.;//magic product of two primes chosen to have high period without float precision issues
+vec2 bbsopt( const vec2 a ) {
+	return fract( a * a * bbsm );
 }
 float bbsopt( const float a ) {
-	return fract( a * a * ( 1.0 / bbsm ) ) * bbsm;
+	return fract( a * a * bbsm );
 }
-float seed(const ivec2 p){
-	vec2 h = bbs(vec2(p.xy));
-	return bbsopt(h.x+bbsopt(h.y))*(1./bbsm);
+vec2 mod1024(const vec2 v){
+	return v - floor(v*0.0009765625)*1024.;
+}
+float seed(const vec2 p){
+	vec2 h0 = bbsopt(p.xy*(1.0/bbsm)); //scale to small value for bbsopt; fp precision errors will make quasi infinite
+	vec2 h1 = bbsopt(mod1024(p.xy)*(1.0/bbsm)+.5); //repeats every 1024 to destroy fp precision artifacts
+	vec2 h2 = h0+h1;//best of both worlds
+	return bbsopt(h2.y+bbsopt(h2.x));
 }
 
 //permutation polynomial
 //based on Gustavson/McEwan https://github.com/ashima/webgl-noise/
 //and Sharpe http://briansharpe.wordpress.com/2011/10/01/gpu-texture-free-noise/
-const float pp_epsilon = .01;
+// the permutation x <- 34x*x + x mod 289 maps 0 to 0.
+// to prevent small values from getting stuck at zero, add a small constant term
+//for efficiency, store all values in (0,1) and use x%y = fract(x/y)*y
+const float pp_epsilon = (1./289.);
 float nextRand(inout float u){//rng
-	u = fract(((u*34.0*289.)+1.0)*u+pp_epsilon);
-	return fract(7.*u);
+	u = fract((u*34.0+1.0)*u+pp_epsilon);
+	return fract((7.*289./288.)*u);
 }
 
 //approximate poisson distribution uniform u
@@ -59,14 +59,14 @@ int poisson(inout float u, const float m){
 }
 
 //Gabor noise based on Lagae, Lefebvre, Drettakis, Dutre 2011
-  float eval_cell(const vec2 cpos, const ivec2 gpos, const ivec2 dnbr, const gnoise_params params, const gnoise_im_params im_params){
-	float u = seed(bound_grid(gpos+dnbr)); //deterministic seed for nbr cell
+  float eval_cell(const vec2 cpos, const vec2 gpos, const vec2 dnbr, const gnoise_params params, const gnoise_im_params im_params){
+	float u = seed(gpos+dnbr); //deterministic seed for nbr cell
 	int impulses = poisson(u, params.density*(1./PI)); //number of impulses in nbr cell
 	vec4 h = params.sector; //annular sector
 	float a = params.a; //bandwidth
 	float aps = im_params.a_prime_square; //intermediate calculations for filtering
-	float filt_scale = aps*im_params.ainv*im_params.ainv;
-	vec2 fpos = cpos - vec2(dnbr);//fragment position in cell space
+	float filt_scale = im_params.filt_scale; //aps*im_params.ainv*im_params.ainv;
+	vec2 fpos = cpos - dnbr;//fragment position in cell space
 	
 	float acc = 0.;
 	//for impulses
@@ -76,7 +76,7 @@ int poisson(inout float u, const float m){
 			vec2 ipos = vec2(nextRand(u), nextRand(u));
 			//displacement to fragment
 			vec2 delta = (fpos - ipos)*im_params.ainv;
-			//impulse frequency, orientation - uniform distribution on input ranges
+			//impulse frequency, orientation - distribution on input ranges
 			float mfreq = pow(2., nextRand(u)*params.sector.y);
 			float ifreq = h.x*mfreq; 
 			float iorientation = mix(h.z-.5*h.w, h.z+.5*h.w, nextRand(u));
@@ -108,7 +108,7 @@ float gnoise(vec2 pos, const gnoise_params params) {
 	//compute positions for this fragment
 	vec2 temp = pos*params.a; 
 	vec2 cpos = fract(temp);
-	ivec2 gpos = bound_grid(ivec2(floor(temp)));
+	vec2 gpos = floor(temp);
 		
 	mat2 jacob = params.jacob;
 	mat2 jacob_t = mat2(jacob[0][0], jacob[1][0], jacob[0][1], jacob[1][1]);
@@ -123,24 +123,27 @@ float gnoise(vec2 pos, const gnoise_params params) {
 	im_params.filter = sigma_fg * sigma_g_inv;	
 	im_params.sigma_f_plus_g_inv = inv2x2(sigma_f + sigma_g);
 	im_params.a_prime_square = 2.*PI*sqrt(det2x2(sigma_fg));
+	im_params.filt_scale = im_params.a_prime_square*im_params.ainv*im_params.ainv;
 
 	float value = 
-		eval_cell(cpos, gpos, ivec2(-1, -1), params, im_params) +
-		eval_cell(cpos, gpos, ivec2(-1,  0), params, im_params) +
-		eval_cell(cpos, gpos, ivec2(-1,  1), params, im_params) +
-		eval_cell(cpos, gpos, ivec2( 0, -1), params, im_params) +
-		eval_cell(cpos, gpos, ivec2( 0,  0), params, im_params) +
-		eval_cell(cpos, gpos, ivec2( 0,  1), params, im_params) +
-		eval_cell(cpos, gpos, ivec2( 1, -1), params, im_params) +
-		eval_cell(cpos, gpos, ivec2( 1,  0), params, im_params) +
-		eval_cell(cpos, gpos, ivec2( 1,  1), params, im_params);
+		eval_cell(cpos, gpos, vec2(-1., -1.), params, im_params) +
+		eval_cell(cpos, gpos, vec2(-1.,  0.), params, im_params) +
+		eval_cell(cpos, gpos, vec2(-1.,  1.), params, im_params) +
+		eval_cell(cpos, gpos, vec2( 0., -1.), params, im_params) +
+		eval_cell(cpos, gpos, vec2( 0.,  0.), params, im_params) +
+		eval_cell(cpos, gpos, vec2( 0.,  1.), params, im_params) +
+		eval_cell(cpos, gpos, vec2( 1., -1.), params, im_params) +
+		eval_cell(cpos, gpos, vec2( 1.,  0.), params, im_params) +
+		eval_cell(cpos, gpos, vec2( 1.,  1.), params, im_params);
 	
 	
 	//ad hoc attempt to normalize
 	value*=.5*pow(params.density+1., -.5);
 	float octexp = pow(2., params.sector.y);
 	value*= (1.+params.sector.y)*octexp/(2.*octexp-1.);
-	
+
 	return value;
+
+	
 }
  
